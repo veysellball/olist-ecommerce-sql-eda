@@ -1,0 +1,5 @@
+duckdb>=1.5
+pandas>=2.2
+matplotlib>=3.8
+jupyter>=1.0
+nbconvert>=7.0

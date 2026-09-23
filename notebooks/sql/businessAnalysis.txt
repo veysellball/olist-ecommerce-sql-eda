@@ -1,0 +1,879 @@
+================================================================================================
+                    BUSINESS ANALYSIS - OLIST SQL EDA (Proje_1_SQL_EDA)
+                    Business analysis, outputs and edge cases of the 10 SQL queries
+================================================================================================
+
+Scope         : the .sql files numbered 01-10 under notebooks/sql/
+Data source   : data/raw/ (Olist Brazilian e-commerce dataset, 9 CSVs)
+Engine        : DuckDB (same table definitions as notebooks/02_sql_queries.ipynb)
+Method        : Every query was run on the real data; outputs and edge cases were
+                quantified with separate verification queries.
+Currency      : BRL (Brazilian Real) - not stated anywhere in the queries
+Report date   : 2026-08-11
+
+TABLE SIZES
+    orders        99,441      order_items   112,650      payments      103,886
+    customers     99,441      reviews        99,224      products       32,951
+    sellers        3,095
+
+DATA TIME RANGE (critical)
+    First order                           : 2016-09-04
+    Last order (any status)               : 2018-10-17
+    Last DELIVERED order (purchase date)  : 2018-08-29   <-- 7-week gap
+    2018-09 has 16 orders and 2018-10 has 4, and NONE of them is delivered.
+
+    => 7 of the queries use the "delivered" filter. As a result, the LAST 1-2 MONTHS of
+       every time series are under-observed. The final point must not be used in any
+       trend interpretation.
+
+
+================================================================================================
+EXECUTIVE SUMMARY - 8 KEY FINDINGS
+================================================================================================
+
+1.  GROWTH HAS STOPPED. Order count went from 750 in 2017-01 to a peak of 7,289 in 2017-11,
+    then moved SIDEWAYS in the 6,100-7,000 band throughout 2018. Monthly revenue over the
+    last 6 months is stuck in the 0.99-1.13M BRL range. This is not maturity, it is a plateau.
+
+2.  THE ONE-ORDER CUSTOMER PROBLEM IS STRUCTURAL. 97% (93,099) of 96,096 unique customers
+    placed only 1 order. Even in the best segment (Champions) the repeat order rate is 6.39%.
+    The real problem of this business: customer acquisition works, retention does not.
+
+3.  58.8% OF THE CUSTOMER BASE IS LOST (54,871 customers, last order 180+ days ago).
+    Only 19.7% are active (last 90 days).
+
+4.  REVENUE IS CONCENTRATED IN 2 SEGMENTS. By RFM, "At-Risk High-Value" (21,966 people)
+    produces 42.9% of revenue and "Champions" (15,377 people) 30.6%. 40% of customers
+    = 73.5% of revenue. The "At-Risk High-Value" segment = spent a lot but drifted away
+    -> the most urgent win-back target.
+
+5.  DELIVERY DELAYS HIT RATINGS DIRECTLY. Average review score is 2.57 for late orders
+    and 4.29 for on-time deliveries. 54% of late orders get 1-2 stars (9.2% for on-time
+    deliveries). Delay = customer-loss chain.
+
+6.  AN OPERATIONAL CRISIS PERIOD WAS IDENTIFIED. Late rate was 21.4% in 2018-03, 16.0% in
+    2018-02 and 14.3% in 2017-11 (Black Friday). Recovery follows: average delivery time
+    fell from 19.6 days to 7.7 days. Capacity planning breaks during campaign periods.
+
+7.  GEOGRAPHIC PARADOX. SP has 42% of customers and most of the revenue, but the LOWEST
+    revenue per customer of any state (147.37 BRL). The highest revenue per customer is in
+    PB (273.48), AC (257.71), RO (246.65) - which are also the states with the slowest
+    delivery (RR 29.3 days, AP 27.2 days, AM 26.4 days; national average ~12 days). This
+    revenue is inflated by freight cost; since the queries don't separate freight,
+    PROFITABILITY IS UNKNOWN.
+
+8.  PAYMENTS DEPEND ON CREDIT CARDS. 73.9% by transaction count and 78.3% by AMOUNT are
+    credit card. Average installments on credit card are 3.5, but the distribution is
+    bimodal (25,455 transactions paid in one go, 5,328 transactions in 10 installments) -
+    the average describes no customer at all.
+
+
+================================================================================================
+PART 1 - QUERY-BY-QUERY ANALYSIS
+================================================================================================
+
+------------------------------------------------------------------------------------------------
+01_monthly_trend.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Monthly order count and average order value (delivered only).
+
+OUTPUT (22 rows)
+    month     orders    avg_value        month     orders    avg_value
+    2016-10       265      165.13        2017-11     7,289      151.92  <- peak (Black Friday)
+    2016-12         1       19.62        2017-12     5,513      147.18
+    2017-01       750      159.63        2018-01     7,069      146.73
+    2017-02     1,653      155.12        2018-02     6,555      142.64
+    2017-03     2,546      153.47        2018-03     7,003      153.58
+    2017-04     2,303      160.49        2018-04     6,798      160.31
+    2017-05     3,546      149.74        2018-05     6,749      161.22
+    2017-06     3,135      147.53        2018-06     6,099      159.38
+    2017-07     3,872      136.58        2018-07     6,159      161.37
+    2017-08     4,193      147.05        2018-08     6,351      150.79  <- under-observed
+    2017-09     4,150      160.41
+    2017-10     4,478      159.89
+
+BUSINESS READING
+    - Strong growth throughout 2017 (750 -> 7,289), a full plateau in 2018 (6,100-7,100 band).
+      No month in 2018 exceeded the 2017-11 peak.
+    - Basket size stayed in the 136-165 BRL band for 22 months; even though it is not
+      inflation-adjusted, it DECLINED IN REAL TERMS. Growth came from volume, not the basket;
+      when volume stopped, revenue stopped.
+    - The query has NO revenue column. When we add it: last 6 months 1.12M / 1.13M / 1.01M /
+      1.01M / 1.03M / 0.99M BRL -> flat line, slightly down.
+
+EDGE CASES
+  [E01-1] CRITICAL - Payment fan-out distorts avg_order_value.
+          An order can have more than one row in the payments table (installment/voucher
+          splitting). 2.98% of orders (2,962 orders) have more than 1 payment row; one
+          order is split into as many as 29 rows.
+          AVG(p.payment_value) gives the average per PAYMENT ROW, not per ORDER.
+          Correct per-order average   : 159.86 BRL
+          Value produced by the query : 153.07 BRL   -> 4.25% UNDER-REPORTING
+          Fix: SUM(payment_value) per order_id first, then AVG.
+          Order COUNT is correct because COUNT(DISTINCT o.order_id) is used - good.
+
+  [E01-2] The last point is unreliable. 2018-08 data is partial (orders bought within the
+          month but not yet delivered are missing from the series). 2018-09 (16 orders) and
+          2018-10 (4 orders) don't appear at all because none of them is delivered.
+          Reading the last month as "started to decline" on the chart would be wrong.
+
+  [E01-3] 2016-12 = 1 order, avg. 19.62 BRL. A single-observation month creates a striking
+          dip on the chart but is statistically meaningless. The 4 orders in 2016-09 are
+          MISSING from the series entirely (see below).
+
+  [E01-4] One order (bfbd0f9bdef84302105ad712db648a6c, 2016-09-15, delivered) has NO MATCH
+          in the payments table. Because of the INNER JOIN it is silently dropped. This
+          single row is the reason for the 1-person difference between Q03 (93,358
+          customers) and Q10 (93,357 customers).
+
+  [E01-5] The delivered filter excludes 2,963 orders (2.98%). Canceled/failed orders are a
+          demand signal; if this is presented as a "demand trend", a separate series is needed.
+
+  [E01-6] The time axis is order_purchase_timestamp (order date). If the accounting/revenue
+          definition were the delivery or invoice date, the monthly distribution would shift.
+          The definition is not written in the report.
+
+  [E01-7] strftime(timestamp,...) is DuckDB-specific. It works in SQLite but not in
+          PostgreSQL (to_char is needed). Not portable.
+
+------------------------------------------------------------------------------------------------
+02_customer_value.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Top 100 spending customers (per unique customer).
+
+OUTPUT (first 10 / 100 rows)
+    #   customer_unique_id   orders   total_spend      avg_value    first / last order
+    1   0a0a9211...              1        13,664.08     13,664.08    2017-09-29 (same day)
+    2   da122df9...              2         7,571.63      3,785.82    2017-04-01 (1 sec apart!)
+    3   763c8b1c...              1         7,274.88      7,274.88    2018-07-15
+    4   dc4802a7...              1         6,929.31      6,929.31    2017-02-12
+    5   459bef48...              1         6,922.21      6,922.21    2018-07-25
+    6   ff4159b9...              1         6,726.66      6,726.66    2017-05-24
+    7   4007669d...              1         6,081.54      6,081.54    2017-11-24
+    8   eebb5dda...              1         4,764.34      4,764.34    2017-04-18
+    9   48e1ac10...              1         4,681.78      4,681.78    2018-06-22
+   10   c8460e42...              4         4,655.91      1,163.98    2018-08-07 -> 2018-08-08
+
+BUSINESS READING
+    - Almost all customers at the top of the list are ONE-ORDER customers. This is not a
+      "most valuable customers" list, it is a "largest single basket" list. It cannot be
+      used directly for CRM/loyalty targeting.
+    - Customer #10 (4 orders within 2 days) is behaviorally different and the closest
+      example to a genuine repeat-customer profile - but it is not at the top.
+    - The right reading from an action standpoint: high-value single baskets may be B2B /
+      corporate purchases or high-priced single products. They should be examined as a
+      separate segment.
+
+EDGE CASES
+  [E02-1] Grouping by customer_unique_id is the RIGHT choice. The customers table has
+          99,441 rows / 99,441 customer_ids but only 96,096 unique customers. Grouping by
+          customer_id would split repeat customers. This query gets that right.
+
+  [E02-2] CRITICAL - "Split orders" are not detected. Customer #2's 2 orders:
+              a96610ab...  2017-04-01 15:58:40   4,950.34 BRL
+              8ea7aebc...  2017-04-01 15:58:41   2,621.29 BRL
+          1 SECOND apart. This is one basket split by the system; counting it as
+          "2 orders" inflates this query as well as the frequency/retention metrics (Q04,
+          Q10). Orders within the same day/minute need to be merged.
+
+  [E02-3] avg_order_value is again an average per payment row. It does NOT MATCH
+          total_spend / total_orders: the two values differ for 3 of the top 100 customers.
+          Small, but an inconsistent column.
+
+  [E02-4] LIMIT 100, no OFFSET/parameter. No share of total revenue, cumulative percentage
+          or Pareto column -> the question "how important is the top 100?" goes unanswered.
+
+  [E02-5] The first_order / last_order columns give the SAME value for 97% of customers
+          (single order). They produce no tenure/lifetime signal and bloat the table.
+
+  [E02-6] No outlier handling. The single 13,664 BRL order also feeds the monetary
+          quantiles in Q10 and enters the "Champions" segment as a one-time buyer.
+
+  [E02-7] 39 unique customers appear in more than one state (same customer_unique_id,
+          different customer_state). Double-counting risk in the geographic breakdown (Q09).
+
+  [E02-8] delivered filter: large canceled baskets are not in the list. A fraud/cancellation
+          analysis needs a separate view.
+
+------------------------------------------------------------------------------------------------
+03_active_inactive_customers.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Segments customers as active / inactive / lost by their last order date.
+
+OUTPUT
+    segment            customer_count   percent
+    lost                      54,871    58.8
+    inactive_90_180d          20,097    21.5
+    active_90d                18,390    19.7
+    TOTAL                     93,358
+
+BUSINESS READING
+    - 58.8% of the customer base is dead. The active customer rate is 19.7%, and even this
+      "active" definition mostly means "placed their FIRST and ONLY order in the last 90 days".
+    - The inactive group (20,097) is the most reasonable target for a reactivation
+      campaign: not yet fully disengaged, contact consent still fresh.
+    - This table alone is misleading: the size of the lost group is a result of the
+      business's age and its one-order structure. Without a cohort reading (Q04) it does
+      not produce action.
+
+EDGE CASES
+  [E03-1] CRITICAL - Threshold dates are HARDCODED ('2018-06-01', '2018-03-01').
+          When the data is refreshed, the query SILENTLY produces wrong results; it raises
+          no error, it just shows everyone as "lost". The reference date should be derived
+          from the data:
+              (SELECT MAX(order_purchase_timestamp) FROM orders)
+          Also, Q10 uses a different reference date ('2018-09-01'). The two queries define
+          "today" differently in the same report -> the segments don't match each other.
+
+  [E03-2] The label and the math don't match. '2018-03-01' to '2018-06-01' is 92 days;
+          relative to the 2018-09-01 reference, 2018-03-01 = 184 days earlier. So
+          "inactive_90_180d" is actually 92-184 days. Small, but the reported label is wrong.
+
+  [E03-3] A TIMESTAMP column is compared with a STRING (last_order_date >= '2018-06-01').
+          It works correctly in DuckDB via implicit cast, but depends on the ISO-8601
+          format and may silently give wrong results in other engines (or a different
+          locale). An explicit DATE '2018-06-01' should be written.
+
+  [E03-4] Because of the delivered filter, customers whose only order was canceled/
+          unavailable are NOT IN the segmentation AT ALL - they aren't even counted as
+          "lost". Yet a customer who never returns after a cancellation is the clearest
+          churn case. 2,963 non-delivered orders become invisible this way.
+
+  [E03-5] Population inconsistency: this query counts 93,358 customers, Q10 counts 93,357.
+          Difference = the single order without a payment row in [E01-4]. Publishing two
+          different "total customers" figures in the same report erodes trust.
+
+  [E03-6] The "active" definition is not behavioral. In a base where 97% are one-order
+          customers, recency measures "when they joined", not loyalty. The metric name
+          creates the wrong expectation.
+
+  [E03-7] There is a single lost threshold (ELSE). A customer who left 180 days ago and one
+          who left 700 days ago are in the same bucket; win-back prioritization is impossible.
+
+------------------------------------------------------------------------------------------------
+04_cohort_retention.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Cohorts by first order month and the repeat purchase rate.
+
+OUTPUT (25 rows)
+    cohort    size      repeat  ret%     cohort    size      repeat  ret%
+    2016-09          4       0   0.0     2017-11     7,304     138   1.9
+    2016-10        321       9   2.8     2017-12     5,487      96   1.7
+    2016-12          1       1 100.0 (!) 2018-01     7,025     122   1.7
+    2017-01        764      33   4.3     2018-02     6,451     110   1.7
+    2017-02      1,752      51   2.9     2018-03     6,965      89   1.3
+    2017-03      2,636      93   3.5     2018-04     6,711      83   1.2
+    2017-04      2,352      81   3.4     2018-05     6,622      65   1.0
+    2017-05      3,596     132   3.7     2018-06     5,940      42   0.7
+    2017-06      3,139     115   3.7     2018-07     6,071      45   0.7
+    2017-07      3,894     120   3.1     2018-08     6,271       8   0.1
+    2017-08      4,184     130   3.1     2018-09         5       0   0.0
+    2017-09      4,130     124   3.0     2018-10         1       0   0.0
+    2017-10      4,470     110   2.5
+
+BUSINESS READING
+    - Retention does not exceed 5% in any cohort. The business effectively runs a
+      ONE-TIME PURCHASE model. This also explains why the F dimension in Q10 is unusable.
+    - The healthiest cohorts are H1 2017 (3.4-4.3%). The decline that follows is largely
+      a measurement artifact (see below) - but the gap between 2017-01 (4.3%) and 2017-10
+      (2.5%) is not entirely an artifact even though they don't have the same observation
+      window: earlier cohorts are better.
+    - Action: retention needs to be tracked not with the cohort table but with a
+      FIXED-WINDOW metric (e.g. "2nd order within 90 days after the first order").
+
+EDGE CASES
+  [E04-1] CRITICAL - RIGHT CENSORING. Cohorts don't have equal observation time. The
+          2017-01 cohort had 21 months to buy again, while the 2018-08 cohort had almost
+          no chance (the data ends in 2018-10).
+          The "steadily falling retention" trend in the table is largely THE RESULT OF
+          THIS, not a real performance decline. This table must NOT BE PRESENTED to
+          management as is.
+          Fix: a fixed window per cohort (M+1, M+3, etc.) or a minimum maturity filter.
+
+  [E04-2] CRITICAL - NO order_status filter. Unlike the other 7 queries, all canceled,
+          unavailable and shipped orders are used both in cohort assignment and in the
+          repeat count (2,963 orders). A canceled order counts as "customer acquired".
+          Population inconsistency across queries.
+
+  [E04-3] Repeat orders within the same month are NOT COUNTED (condition:
+          a.order_month > f.first_month). A customer who buys again 3 days after their
+          first order appears as "did not repeat". Same-day split orders ([E02-2]) are also
+          ignored here. Retention is systematically UNDER-reported.
+
+  [E04-4] Micro-cohorts are not filtered: the 2016-12 cohort has 1 person and shows 100%
+          retention. The same goes for 2016-09 (4), 2018-09 (5), 2018-10 (1). A 100% bar
+          wrecks the whole scale of a chart. A threshold like HAVING cohort_size >= 50 is
+          a must.
+
+  [E04-5] This is NOT A COHORT MATRIX. It only gives the binary "ever bought again"
+          outcome; there are no M+1, M+2, M+3 breakdowns, so you can't see when churn
+          happens. A retention curve cannot be drawn.
+
+  [E04-6] Months are compared as strings ('2018-01' > '2017-12'). Lexicographic ordering
+          works in the '%Y-%m' format, but silently breaks if the format changes (e.g.
+          '%m-%Y'). Comparing with a date type is safer.
+
+  [E04-7] Performance/correctness: the LEFT JOIN between first_order and customer_activity
+          multiplies rows per customer (98k+ rows), then collapses them with COUNT(DISTINCT
+          CASE...). The result is correct but expensive and hard to read; also, the LEFT
+          JOIN is in practice an INNER join (every customer has at least 1 activity) -
+          it sends a misleading signal.
+
+------------------------------------------------------------------------------------------------
+05_return_anomaly.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : The file name says "return anomaly"; the query actually computes the
+               CANCELLATION RATE PER CATEGORY and the deviation from the overall average
+               (min 50 orders, top 20).
+
+OUTPUT (20 rows - first 10)
+    category                          orders  canceled  cancel%  deviation
+    dvds_blu_ray                           59      2    3.39  +2.87
+    telefonia_fixa                        217      3    1.38  +0.86
+    livros_interesse_geral                512      7    1.37  +0.85
+    eletrodomesticos_2                    234      3    1.28  +0.76
+    instrumentos_musicais                 628      8    1.27  +0.75
+    eletroportateis                       630      8    1.27  +0.75
+    construcao_ferramentas_seguranca      167      2    1.20  +0.68
+    construcao_ferramentas_jardim         194      2    1.03  +0.51
+    NULL  (!)                           1,451     14    0.96  +0.44
+    fashion_roupa_masculina               112      1    0.89  +0.37
+    overall_avg = 0.519322 (unrounded)
+
+BUSINESS READING
+    - The apparent picture: cancellation rates range from 0.6-3.4% by category, the overall
+      level is low. At first glance one would say "we don't have a cancellation problem".
+    - THIS IS NOT THE REAL PICTURE. Because of [E05-1] below, most of the unfulfilled
+      orders never enter this analysis. The output of this query CANNOT currently be used
+      as a risk signal.
+    - The only meaningful structural finding: cancellation is a rare event (true overall
+      rate 0.63%) and category differences stay below small-sample noise.
+
+EDGE CASES
+  [E05-1] MOST CRITICAL FINDING - Silent undercount / survivorship bias.
+          The query builds the products -> order_items -> orders chain with INNER JOINs.
+          But most failed orders have NO order_items RECORD:
+              unavailable : only   6 of 609 orders are in order_items  (1.0%)
+              canceled    :      461 of 625 orders are in order_items  (73.8%)
+          So 767 of 1,234 problem orders are INVISIBLE in this analysis. The
+          cancellation/non-fulfillment rate is structurally UNDER-reported and the worst
+          cases (unavailable) disappear completely.
+
+  [E05-2] The 'unavailable' status is not included in the numerator at all. From the
+          customer's point of view, "out of stock, your order could not be fulfilled" is
+          the clearest failure; the query only counts 'canceled'.
+
+  [E05-3] The file name doesn't match the content. The dataset has NO RETURN (return/refund)
+          data. The name "return_anomaly" creates the wrong expectation for the reader. The
+          only signal usable as a return proxy is reviews.review_score / the review text.
+
+  [E05-4] Fan-out: multi-category orders are counted twice. 727 orders contain products from
+          more than one category. The sum of per-category order counts is 99,470; the real
+          order count is 98,666. The percentages are on a "category-order" base, not an
+          "order" base; the table doesn't say so.
+
+  [E05-5] The NULL category comes out as an ANALYSIS ROW (1,451 orders, 610 products).
+          A "NaN" row appears in the output. Either COALESCE(...,'unknown') or an explicit
+          filter is needed; in its current state it is not presentation-ready.
+
+  [E05-6] Statistical invalidity. The HAVING >= 50 threshold is too low. dvds_blu_ray at
+          the top means 2 CANCELLATIONS in 59 orders; a single cancellation moves the rate
+          by 1.7%. The "top 20 anomalies" list is effectively a "categories with the
+          smallest samples" list. No confidence interval / proportion test (e.g. binomial).
+
+  [E05-7] overall_avg uses the WRONG BASE. AVG(cancel_pct) OVER () = the unweighted average
+          of category rates (0.5193), computed AFTER the HAVING (i.e. only over categories
+          with 50+ orders). The true overall cancellation rate is 0.63%.
+          The "deviation" column is measured against the wrong reference. A weighted rate
+          should be used.
+
+  [E05-8] The overall_avg column is not ROUNDed -> a noisy column like 0.519322 in the
+          output. All other columns are rounded; inconsistent.
+
+  [E05-9] The ORDER BY cancel_pct DESC + LIMIT 20 combination, together with [E05-6],
+          systematically pushes small categories to the top. Ordering together with an
+          absolute cancellation COUNT column (impact-based) would be more correct.
+
+------------------------------------------------------------------------------------------------
+06_delivery_delay.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Monthly late-delivery rate (against the promised date) and average delivery time.
+
+OUTPUT (23 rows)
+    month     orders   late     late%    avg.days    month    orders   late     late%    avg.days
+    2016-09         1        1     100.0     55.0     2017-11    7,288    1,043     14.3     15.1
+    2016-10       265        3       1.1     19.6     2017-12    5,513      462      8.4     15.3
+    2016-12         1        0       0.0      5.0     2018-01    7,069      464      6.6     14.0
+    2017-01       750       23       3.1     12.8     2018-02    6,555    1,048     16.0     16.9
+    2017-02     1,653       53       3.2     13.3     2018-03    7,003    1,496     21.4     16.2
+    2017-03     2,546      142       5.6     13.0     2018-04    6,798      361      5.3     11.4
+    2017-04     2,303      181       7.9     15.0     2018-05    6,749      556      8.2     11.3
+    2017-05     3,545      128       3.6     11.4     2018-06    6,096       83      1.4      9.2
+    2017-06     3,135      121       3.9     12.0     2018-07    6,156      276      4.5      8.9
+    2017-07     3,872      133       3.4     11.5     2018-08    6,351      660     10.4      7.7
+    2017-08     4,193      139       3.3     11.0
+    2017-09     4,150      216       5.2     11.7     TOTAL LATE: 7,826 orders
+    2017-10     4,478      237       5.3     11.7
+
+BUSINESS READING (the most actionable part of the report)
+    - Three crisis periods stand out: 2017-11 (14.3% - Black Friday), 2018-02 (16.0%) and
+      2018-03 (21.4% - 1 in every 5 orders late). In 2018-03, 1,496 customers experienced
+      a delivery where the promise was broken.
+    - Delivery TIME shows steady improvement: ~12-15 days on average in 2017,
+      8.9 / 7.7 days in 2018-07/08. Operations are getting faster.
+    - But the late RATE and the delivery time don't move together (2018-08: time 7.7 days,
+      the best; late rate 10.4%, bad). This shows that promised dates
+      (estimated_delivery_date) are calculated too optimistically. The problem is not
+      transport speed but the PROMISE-SETTING policy.
+    - Business impact (additional analysis): avg. review 2.57 for late orders / 4.29 for
+      on-time. 54% of late orders get 1-2 stars (9.2% for on-time). Roughly 4,200 of the
+      7,826 late orders turn directly into negative reviews.
+
+EDGE CASES
+  [E06-1] CRITICAL - The late definition misuses the time component.
+          ALL of order_estimated_delivery_date (99,441 rows) is at 00:00:00.
+          order_delivered_customer_date, however, contains the real time. So an order
+          delivered at 14:00 within the promised DAY is counted as "late".
+          1,292 (16.5%) of the 7,826 "late" orders were delivered ON THE SAME CALENDAR DAY.
+          True lateness is ~6,534 orders. All monthly late rates are INFLATED by about 16%.
+          Fix: DATE_TRUNC('day', order_delivered_customer_date) > order_estimated_delivery_date
+
+  [E06-2] The SIZE of the delay is not measured. A 1-day delay and a 30-day delay count the
+          same. Customer impact and compensation cost are completely different.
+          An AVG(DATEDIFF('day', estimated, delivered)) column should be added.
+
+  [E06-3] Undelivered orders are NOT in the analysis. The worst customer experience
+          (1,107 shipped + 609 unavailable + 625 canceled) doesn't show up in the "delay"
+          metric. The metric is computed only over orders that eventually succeeded
+          -> optimistic.
+
+  [E06-4] 2018-08 CENSORING. Orders bought within the month but not yet delivered are
+          missing from the series; only FAST deliveries show up. This both makes
+          avg_delivery_days (7.7) look artificially good and distorts the late rate.
+          The statement "delivery time dropped to 7.7 days" is indefensible as is.
+
+  [E06-5] 8 orders have order_status='delivered' yet order_delivered_customer_date is NULL.
+          They are correctly excluded by the WHERE, but this data-quality issue shows the
+          'delivered' status can't be fully trusted (these 8 orders are counted in Q01 but
+          not in Q06 -> small count differences between the two queries come from here;
+          e.g. 2017-05: 3,546 vs 3,545).
+
+  [E06-6] The 2016-09 row: 1 order, 100% late, 55 days. It hijacks the entire y axis on a
+          chart. No minimum order threshold.
+
+  [E06-7] avg_delivery_days measures purchase -> delivery; approval, preparation and
+          shipping times are not separated. It is unknown at which stage the improvement
+          happened (the order_approved_at and order_delivered_carrier_date columns are
+          not used).
+
+  [E06-8] Since this query uses a single table (orders), COUNT(*) is safe - no fan-out.
+          Unlike the other queries, it is correct here. (Positive note.)
+
+------------------------------------------------------------------------------------------------
+07_seller_performance.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Top 30 sellers by revenue (min 20 orders), product variety and average rating.
+
+OUTPUT (first 10 / 30 rows)
+    #  seller_id     state  orders   variety      total_revenue   avg_rating
+    1  4869f7a5...     SP     1,124        94       226,987.93     4.14
+    2  53243585...     BA       348        23       217,940.44     4.13   <- high basket
+    3  4a3ca931...     SP     1,772       394       199,408.32     3.83
+    4  fa1c13f2...     SP       578       284       190,917.14     4.37
+    5  7c67e144...     SP       973       197       188,063.83     3.35   <- risk
+    6  7e93a43e...     SP       319       175       165,981.49     4.36
+    7  da8622b1...     SP     1,311       221       162,303.67     4.08
+    8  7a67c85e...     SP     1,145       146       140,238.65     4.27
+    9  1025f0e2...     SP       910       153       139,720.16     3.87
+   10  955fee92...     SP     1,261       103       131,906.71     4.09
+
+BUSINESS READING
+    - Geographic concentration: 9 of the top 10 are in SP state. The supply chain depends
+      on a single region; this also explains delivery times in remote states
+      (Q09/E6: RR 29.3 days).
+    - There are two different successful models: high volume/small basket (#1: 1,124
+      orders) and low volume/large basket (#2: 217,940 BRL from 348 orders -> ~626 BRL per
+      order). The two should be managed differently.
+    - RISK: seller #5 generates 188,063 BRL of revenue but has an average rating of 3.35 -
+      the lowest on the list. High revenue + low satisfaction = platform reputation risk.
+      #3 (3.83) is the second risk.
+    - An inverse relationship between product variety and rating stands out (394 variety
+      -> 3.83). A broad catalog may be straining operational quality.
+
+EDGE CASES
+  [E07-1] CRITICAL - A double fan-out distorts the average rating.
+          (a) The query's grain is order_items. Because reviews are joined by order_id, an
+              order's rating is REPEATED as many times as there are item rows in that
+              order. Result: AVG(review_score) is weighted by basket size - multi-item
+              orders dominate the rating.
+          (b) 547 orders have more than 1 record in the reviews table -> additional double
+              counting.
+          Measured deviation (seller 4a3ca931...): correct order-level average 3.858,
+          row-level average produced by the query 3.799. Direction and size vary by
+          seller; the ranking is not reliable.
+          Fix: deduplicate reviews per order_id first and average at order level.
+
+  [E07-2] total_revenue = SUM(oi.price) -> EXCLUDING FREIGHT. Freight is 16.6% of product
+          price (13.59M vs 15.84M BRL). The "revenue" definition is not stated in the
+          report; it is unclear whether it is seller payout or platform GMV. Comparisons
+          are very sensitive to this definition.
+
+  [E07-3] "product_variety" = COUNT(DISTINCT product_id), i.e. catalog depth, NOT UNITS
+          SOLD. The name is misleading; units need COUNT(*) or SUM(quantity).
+
+  [E07-4] The delivered filter hides the seller's FAILURES. A seller who cancels a lot looks
+          spotless in this table. In seller performance, cancellation/late rate matters at
+          least as much as revenue - neither is in the table.
+
+  [E07-5] Multi-seller orders are credited to each seller as a FULL order
+          (COUNT(DISTINCT oi.order_id)). Summed across sellers, order counts exceed the
+          real total.
+
+  [E07-6] No RELIABILITY column for the rating. How many reviews it rests on is not shown;
+          NULL reviews are silently skipped by AVG. It's unknown whether a 3.35 rating
+          comes from 20 reviews or 900.
+
+  [E07-7] LIMIT 30 / 3,095 sellers. The long tail is invisible, there is no Pareto or
+          revenue-share column. The question "what percentage of total revenue do the top
+          30 sellers produce?" goes unanswered - platform dependency risk can't be measured.
+
+  [E07-8] The HAVING >= 20 threshold eliminates small sellers; this is a deliberate choice
+          but the threshold is not documented in the report, and the result can be read
+          as "all sellers".
+
+------------------------------------------------------------------------------------------------
+08_payment_analysis.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Transaction count, average installments, average amount and market share
+               by payment type.
+
+OUTPUT
+    payment_type   transaction_count   avg_installments   avg_amount   market_share(count)
+    credit_card          76,795          3.5      163.32        73.9
+    boleto               19,784          1.0      145.03        19.0
+    voucher               5,775          1.0       65.70         5.6
+    debit_card            1,529          1.0      142.57         1.5
+
+    ADDITIONAL MEASUREMENT - share by AMOUNT (not in the query):
+    credit_card   12,542,084 BRL   78.3%      voucher     379,437 BRL   2.4%
+    boleto         2,869,361 BRL   17.9%      debit_card  217,990 BRL   1.4%
+
+BUSINESS READING
+    - Credit card dominates (73.9% by count / 78.3% by amount). The installment
+      infrastructure is at the center of the business model.
+    - Boleto (a Brazil-specific bank payment slip) is a serious second channel at 19%; it
+      is single-payment and carries payment-delay/abandonment risk - it should be read
+      together with the cancellation analysis.
+    - Voucher's share by count (5.6%) is more than twice its share by amount (2.4%):
+      vouchers are small and mostly a PARTIAL payment. Presenting it as a "market share"
+      is wrong.
+    - The 3.5-installment average is misleading: the distribution is bimodal - 25,455
+      transactions paid in one go, 12,413 in two installments, 10,461 in three, 5,328 in
+      10 installments. Some customers pay upfront, others use long-term financing; a single
+      average hides both.
+
+EDGE CASES
+  [E08-1] CRITICAL - Grain error: the metrics are per PAYMENT ROW, not per ORDER.
+          "market_share" = share of payment transactions, not share of customer/order
+          preference. 800 orders have more than one voucher row; these orders
+          mathematically inflate vouchers. The question "which method was the order paid
+          with" must be computed separately at order level (with a dominant-method logic).
+
+  [E08-2] The methods are NOT MUTUALLY EXCLUSIVE. The same order can be paid with credit
+          card + voucher. Percentages summing to 100 gives the impression that the methods
+          exclude each other; that isn't the case.
+
+  [E08-3] For voucher, avg_amount = 65.70 BRL is NOT A BASKET SIZE, it is a partial payment
+          piece. As is, the table invites a wrong inference like "voucher users make small
+          purchases".
+
+  [E08-4] NO order_status filter. Payments of canceled and unavailable orders are counted
+          too. Q01/Q02/Q09 filter on delivered -> in the same report, total payments
+          (16.0M BRL) and revenue (15.42M BRL delivered) don't match, with no explanation.
+
+  [E08-5] Dirty rows: 9 payment rows have payment_value = 0, 2 rows have
+          payment_installments = 0. They enter the averages (very small effect, but there
+          is no data-quality check). 3 'not_defined' rows are correctly excluded.
+
+  [E08-6] Median/distribution needed instead of average installments ([E08 business
+          reading]). Also, the relationship between installments and amount (large basket
+          -> many installments) is not examined at all; financing cost analysis is impossible.
+
+  [E08-7] No time dimension. It's unknown whether payment preference changed between 2016
+          and 2018; this is the most critical input for installment strategy decisions.
+
+  [E08-8] No coupon/discount separation: vouchers should be treated as a promotion cost,
+          not as a revenue item.
+
+------------------------------------------------------------------------------------------------
+09_geographic_analysis.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Customer count, order count, total revenue and revenue per customer by state.
+
+OUTPUT (27 rows - all)
+    state   customers orders     revenue(BRL)  per_customer     state   customers orders  revenue per_cust.
+    SP       39,155   40,500   5,770,266.19     147.37       PB          504      517  137,835  273.48
+    RJ       11,917   12,350   2,055,690.45     172.50       MS          681      701  134,422  197.39
+    MG       11,001   11,354   1,819,277.61     165.37       PI          464      476  105,272  226.88
+    RS        5,168    5,345     861,802.40     166.76       RN          464      474  100,728  217.09
+    PR        4,769    4,923     781,919.55     163.96       AL          387      397   94,196  243.40
+    SC        3,449    3,546     595,208.40     172.57       SE          329      335   70,289  213.64
+    BA        3,158    3,256     591,270.60     187.23       TO          267      274   60,007  224.75
+    DF        2,019    2,080     346,146.17     171.44       RO          231      243   56,976  246.65
+    GO        1,895    1,957     334,294.22     176.41       AM          140      145   27,596  197.12
+    ES        1,928    1,995     317,682.65     164.77       AC           76       80   19,586  257.71
+    PE        1,551    1,593     309,074.59     199.27       AP           66       67   16,142  244.57
+    CE        1,258    1,279     266,463.97     211.82       RR           40       41    9,040  225.99
+    PA          922      946     212,027.55     229.96
+    MT          856      886     181,441.72     211.96
+
+BUSINESS READING
+    - Extreme concentration: SP has 42% of customers and ~37% of revenue. The top 3 states
+      (SP, RJ, MG) account for ~62% of revenue. Dependence on a single region is both a
+      revenue and a logistics risk.
+    - INVERSE RELATIONSHIP: as volume grows, revenue per customer FALLS. SP is lowest
+      (147.37), north/northeast states are highest (PB 273.48 / AC 257.71 / RO 246.65).
+    - There are most likely two reasons for this: (a) in remote states freight cost is
+      included in payment_value -> revenue is inflated, (b) because of high freight, only
+      large baskets get ordered (small baskets aren't economical).
+    - Additional measurement (delivery time, by state): RR 29.3 / AP 27.2 / AM 26.4 /
+      AL 24.5 / PA 23.7 days. So the states with the highest revenue per customer are also
+      the WORST-served states. The growth opportunity is here, but logistics must be
+      solved first.
+    - Action: this table alone is not enough to say "invest in the north" - PROFITABILITY
+      cannot be known without separating freight cost.
+
+EDGE CASES
+  [E09-1] CRITICAL GAP - Freight cost is not separated. payment_value includes product +
+          freight together; nationally freight is 16.6% of product price, and much higher
+          in remote states. The "revenue_per_customer" ranking may largely be a FREIGHT
+          ranking. price and freight_value should be added as separate columns (order_items).
+
+  [E09-2] 39 unique customers appear in more than one state -> the sum of per-state
+          COUNT(DISTINCT customer_unique_id) exceeds the true unique customer count.
+          The effect is negligible, but the totals don't match exactly.
+
+  [E09-3] The state is taken from the CUSTOMER RECORD, not from the order's delivery
+          address. Moving house / gift shipments / corporate addresses cause wrong
+          assignment.
+
+  [E09-4] Small samples: RR 40, AP 66, AC 76 customers. In these states revenue per
+          customer swings sharply with a single large order. No confidence interval or
+          minimum n threshold; small states rise to the top of the ranking.
+
+  [E09-5] The delivered filter is geographically BIASED. More orders are dropped in remote
+          states where delivery fails most -> those states' performance looks BETTER than
+          it is.
+
+  [E09-6] No normalization by population. SP's dominance is largely demographic; growth
+          potential can't be read without computing "market penetration" (customers /
+          state population). The dataset has no population data; it must be added from
+          outside.
+
+  [E09-7] The geolocation CSV (olist_geolocation_dataset.csv) was never loaded. Zip code /
+          lat-long breakdowns, city-level analysis and distance-cost modeling are
+          impossible. State is the coarsest geographic level.
+
+  [E09-8] No time dimension - you can't see which states grew or shrank.
+
+------------------------------------------------------------------------------------------------
+10_rfm_segmentation.sql
+------------------------------------------------------------------------------------------------
+WHAT IT ASKS : Customer segmentation based on R (recency) x M (monetary). F (frequency) is
+               deliberately left off the axes, and the rationale is written in the file.
+
+OUTPUT
+    segment              customers   avg_spend   avg_recency   repeat_order%
+    Lost                    22,829         72.97      398 days            1.05
+    At-Risk High-Value      21,966        301.48      337 days            5.71
+    Champions               15,377        306.71       94 days            6.39
+    New Low-Spend           14,376         54.70       92 days            0.51
+    Dormant                 11,243         72.27      222 days            0.93
+    Promising                7,566        108.26       93 days            1.90
+    TOTAL                   93,357
+
+    ADDITIONAL MEASUREMENT - REVENUE SHARE by segment (not in the query):
+    At-Risk High-Value  6,622,381 BRL   42.9%        Promising        819,080 BRL   5.3%
+    Champions           4,716,302 BRL   30.6%        Dormant          812,515 BRL   5.3%
+    Lost                1,665,875 BRL   10.8%        New Low-Spend    786,309 BRL   5.1%
+
+BUSINESS READING
+    - THE SINGLE MOST IMPORTANT FINDING: "At-Risk High-Value" (21,966 people, 23.5%)
+      produced 42.9% of revenue and has not purchased for 337 DAYS on average. This segment
+      alone is the biggest revenue risk and the biggest win-back opportunity.
+    - "Champions" (15,377 people) produce 30.6% of revenue, avg. recency 94 days. The core
+      to protect. But the repeat order rate is only 6.39% - even a "champion" is
+      effectively a one-order customer.
+    - Lost + Dormant = 34,072 people (36.5%) but only 16.1% of revenue. Low priority;
+      expensive reactivation campaigns should not target this group.
+    - "New Low-Spend" (14,376) is fresh but small-basket. A basket-growth
+      (cross-sell/bundle) target.
+    - The methodological quality of this query is HIGHER than the other 9: using CUME_DIST
+      instead of NTILE and why the F dimension was left out are clearly documented in the
+      file. This is a correct and defensible decision - the repeat order rate column also
+      backs it up with data (6.39% at most).
+
+EDGE CASES
+  [E10-1] The reference date '2018-09-01' is HARDCODED. It is safe right now (checked: the
+          most recent recency is 3 days, there are NO customers with negative recency, and
+          NO delivered orders after 2018-09-01). BUT when the data is refreshed it silently
+          breaks and produces NEGATIVE recency - it scrambles the CUME_DIST ordering without
+          raising an error.
+          Fix: (SELECT MAX(order_purchase_timestamp) + INTERVAL 1 DAY FROM orders)
+
+  [E10-2] REFERENCE DATE CONFLICT with Q03. Q03 uses the '2018-06-01'/'2018-03-01'
+          thresholds, Q10 the '2018-09-01' reference. There are two different definitions
+          of "today" in the same report; Q03's "active_90d" group (18,390) and Q10's high-R
+          segments don't agree. They should be fed by a single parameter.
+
+  [E10-3] The segmentation population is 93,357 - 97.1% of the 96,096 unique customers.
+          2,739 customers (those with no delivered order at all) are NOT IN the
+          segmentation AT ALL. They are real churn candidates; they should be reported as
+          an "unsegmented" group. Also, 1 more customer drops out because of the payments
+          join ([E01-4]).
+
+  [E10-4] For 97% of customers the M dimension is a SINGLE ORDER AMOUNT. So "monetary"
+          effectively measures BASKET SIZE, not lifetime value. Segment names ("Champions")
+          suggest loyalty but there is no loyalty data underneath. The naming may create
+          wrong expectations - the note in the file partly explains this.
+
+  [E10-5] Outlier effect: the one-time 13,664 BRL order ([E02-6]) feeds the top monetary
+          quantile and enters the "Champions" segment. No winsorizing or B2B separation.
+
+  [E10-6] The "At-Risk High-Value" rule is too broad (r_score <= 3 AND m_score >= 4).
+          42.9% of revenue sits in a single bucket. r=3 (mid recency) and r=1 (very old)
+          get the same treatment; for campaign prioritization this segment must be split
+          into sub-segments.
+
+  [E10-7] The CASE rules are fully exhaustive (every r,m combination falls into a segment,
+          no NULL segment) - verified, no problem. But ELSE 'Dormant' is a "leftover"
+          bucket; r=3 & m<=3 mixtures fall into it, it isn't homogeneous.
+
+  [E10-8] Portability: DATEDIFF, CUME_DIST, CEIL, (frequency > 1)::INT are DuckDB syntax.
+          ::INT works in PostgreSQL but DATEDIFF doesn't; SQLite has no CUME_DIST. The query
+          is engine-dependent.
+
+  [E10-9] repeat_order_rate is computed from frequency after the order_status='delivered'
+          filter. Canceled second orders are not counted -> repeat tendency looks somewhat
+          LOWER. It doesn't change the direction of the finding.
+
+
+================================================================================================
+PART 2 - CROSS-CUTTING (CROSS-QUERY) EDGE CASE LOG
+================================================================================================
+
+[X-1] GRAIN INCONSISTENCY - the biggest source of errors
+      The tables have different grains: orders (1 row/order), order_items (1 row/item),
+      payments (1 row/payment transaction), reviews (1 row/review, 2 for 547 orders).
+      When these tables are JOINed, rows multiply and every metric that takes an AVERAGE
+      is distorted.
+      Affected: Q01 (AOV 4.25% low), Q02 (avg. order value), Q07 (avg. rating),
+      Q08 (all metrics).
+      SUM and COUNT(DISTINCT) are robust to fan-out; AVG IS NOT. Rule: in multi-table
+      queries, aggregate at the right grain first (CTE), then take the average.
+
+[X-2] order_status FILTER INCONSISTENCY
+      delivered filter : 01, 02, 03, 06, 07, 09, 10
+      no filter        : 04, 05, 08
+      Result: populations don't match across queries (e.g. total payments 16.0M BRL,
+      delivered revenue 15.42M BRL). Using different universes within the same report is
+      indefensible in a presentation. A single filter policy (and its rationale) must be set.
+
+[X-3] TIME CUTOFF / CENSORING
+      Purchase data runs to 2018-10-17, delivered orders to 2018-08-29.
+      The last 1-2 points of every time series (Q01, Q04, Q06) are under-observed.
+      The entire cohort table (Q04) is under right censoring.
+      RULE: the last month must not be interpreted on any chart; cohort tables must be
+      converted to a fixed window.
+
+[X-4] HARDCODED DATES, DIFFERENT DEFINITIONS OF "TODAY"
+      Q03: '2018-06-01' / '2018-03-01'     Q10: '2018-09-01'
+      Neither is derived from the data. When the data is refreshed they silently give
+      wrong results (they raise no error - the most dangerous type of bug). They should
+      be tied to a single parameter.
+
+[X-5] NO SMALL-SAMPLE CONTROL
+      Q04 (1-person cohort, 100% retention), Q05 (2 cancellations in 59 orders = "top
+      anomaly"), Q06 (100% late in a 1-order month), Q09 (a state with 40 customers).
+      No query has a minimum n threshold or a confidence interval. The top of every ranking
+      is systematically filled with NOISE.
+
+[X-6] INVISIBILITY OF FAILED ORDERS
+      1,107 shipped + 625 canceled + 609 unavailable + 314 invoiced + 301 processing
+      = 2,963 orders (2.98%). The delivered filters drop them; in Q05, 99% of unavailable
+      orders have no order_items record, so they are structurally invisible. The WORST
+      side of the customer experience is not measured in any query.
+
+[X-7] UNUSED DATA SOURCES
+      olist_geolocation_dataset.csv        -> never loaded (no city/zip/coordinate analysis)
+      product_category_name_translation.csv-> never loaded (Q05 output is in Portuguese,
+                                              "dvds_blu_ray", "eletroportateis", etc.)
+      Unused columns as well: order_approved_at, order_delivered_carrier_date
+      (delivery-stage analysis), review_comment_message (return/complaint proxy),
+      product_weight_g / dimensions (freight cost model).
+
+[X-8] AMBIGUOUS REVENUE DEFINITION
+      payments.payment_value and order_items.(price+freight_value) don't match for 380
+      orders (0.39%). Q01/02/09/10 use payment_value, Q07 uses price (excluding freight).
+      "Revenue" must be fixed to a single definition across the report.
+
+[X-9] PORTABILITY / ENGINE DEPENDENCE
+      The uses of strftime, DATEDIFF, CUME_DIST, ::INT, CEIL are DuckDB-specific.
+      The queries can't be moved to PostgreSQL or SQLite as is. If they go to production,
+      a target engine must be chosen.
+
+[X-10] NOTEBOOK ENCODING RISK
+      In notebooks/02_sql_queries.ipynb the queries are read with open(...); encoding='utf-8'
+      is given ONLY for 10_rfm_segmentation.sql. On Windows the default encoding is
+      cp1254; any .sql file containing Turkish characters raises UnicodeDecodeError or is
+      read corrupted (Q10 was already fixed for exactly this reason).
+      encoding='utf-8' should be standardized in ALL cells.
+
+[X-11] SPLIT ORDERS
+      The same customer's orders created seconds apart are counted separately ([E02-2]).
+      This inflates the frequency (Q02, Q10), retention (Q04) and order count (Q01)
+      metrics. A rule is needed to merge orders within the same day.
+
+[X-12] CURRENCY AND INFLATION
+      No query states the currency (BRL). No adjustment was made for Brazilian inflation
+      between 2016-2018; the statement "basket size stayed flat" is nominal - in real
+      terms it is a DECLINE.
+
+[X-13] OUTPUTS ARE NOT PERSISTED
+      The reports/ and src/ folders are EMPTY. The queries only run inside the notebook,
+      results are not written to disk; no reproducibility and no version tracking.
+
+
+================================================================================================
+PART 3 - PRIORITIZED ACTION LIST
+================================================================================================
+
+FIX FIRST (errors that change the result)
+ P1  Q05 - Measuring unavailable/canceled orders through order_items must be abandoned.
+          The non-fulfillment analysis should be built on the orders table. [E05-1, E05-2]
+ P2  Q04 - The cohort table should be converted to a fixed-window metric (e.g. 90-day
+          repeat purchase rate); it must not be reported in its current form. [E04-1]
+ P3  Q06 - The late definition should be moved to day level (DATE_TRUNC). Current late
+          rates are inflated by ~16%. [E06-1]
+ P4  Q01/Q02/Q08 - Payment metrics should first be summed per order_id, then averaged.
+          AOV should be 159.86 instead of the current 153.07. [E01-1]
+ P5  Q07 - reviews should be deduplicated per order_id and averaged at order level. [E07-1]
+
+STANDARDIZE NEXT (consistency)
+ P6  A single reference-date parameter (derived from the data) in all queries. [X-4]
+ P7  The same, documented order_status filter policy in all queries. [X-2]
+ P8  A single "revenue" definition (payment_value or price+freight). [X-8]
+ P9  Minimum sample threshold + small-n warning in all rankings. [X-5]
+ P10 encoding='utf-8' standard in the notebook; results written under reports/. [X-10, X-13]
+
+ADD TO THE ANALYSIS (high business value, currently missing)
+ P11 Monthly REVENUE series (missing in Q01) and freight/product separation (Q07, Q09).
+ P12 Delay SIZE (how many days) and delivery stages (approval / handed to carrier / customer).
+ P13 Measuring the delay -> review score -> repeat purchase chain
+     (the first link was confirmed in this report: 2.57 vs 4.29 rating).
+ P14 Loading the product_category_name_translation and geolocation files.
+ P15 Sub-segmenting "At-Risk High-Value" (42.9% of revenue in a single bucket). [E10-6]
+
+================================================================================================
+                                    END OF REPORT
+================================================================================================
